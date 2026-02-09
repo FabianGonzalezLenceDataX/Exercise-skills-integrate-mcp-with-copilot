@@ -5,11 +5,15 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
+import json
+import secrets
 from pathlib import Path
+from typing import Optional
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +22,20 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Load teachers from JSON file
+teachers_file = Path(__file__).parent.parent / "teachers.json"
+with open(teachers_file, 'r') as f:
+    teachers_data = json.load(f)
+    teachers_db = {teacher['username']: teacher['password'] for teacher in teachers_data['teachers']}
+
+# In-memory session store (username -> token)
+active_sessions = {}
+
+# Pydantic models
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 # In-memory activity database
 activities = {
@@ -78,6 +96,24 @@ activities = {
 }
 
 
+def verify_teacher(authorization: Optional[str] = Header(None)):
+    """Verify that the request is from an authenticated teacher"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    # Check if token exists in active sessions
+    username = None
+    for user, token in active_sessions.items():
+        if token == authorization:
+            username = user
+            break
+    
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    return username
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,9 +124,40 @@ def get_activities():
     return activities
 
 
+@app.post("/login")
+def login(credentials: LoginRequest):
+    """Authenticate a teacher and return a session token"""
+    username = credentials.username
+    password = credentials.password
+    
+    # Verify credentials
+    if username not in teachers_db or teachers_db[username] != password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    
+    # Generate a session token
+    token = secrets.token_urlsafe(32)
+    active_sessions[username] = token
+    
+    return {"token": token, "username": username}
+
+
+@app.post("/logout")
+def logout(username: str = Depends(verify_teacher)):
+    """Logout a teacher and invalidate their session"""
+    if username in active_sessions:
+        del active_sessions[username]
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/verify")
+def verify_session(username: str = Depends(verify_teacher)):
+    """Verify if a session is still valid"""
+    return {"authenticated": True, "username": username}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(activity_name: str, email: str, username: str = Depends(verify_teacher)):
+    """Sign up a student for an activity (teachers only)"""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +178,8 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(activity_name: str, email: str, username: str = Depends(verify_teacher)):
+    """Unregister a student from an activity (teachers only)"""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
